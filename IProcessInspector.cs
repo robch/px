@@ -19,6 +19,12 @@ interface IProcessInspector
     // pipes, devices, and other OS-specific handle/descriptor types are intentionally excluded.
     OpenFilesResult GetOpenFiles(int pid);
 
+    // Lists TCP/UDP ports currently owned by the process. Not yet implemented on every
+    // platform; the default falls back to a "not supported" error so callers don't need to
+    // special-case platforms that haven't added a real implementation yet.
+    OpenPortsResult GetOpenPorts(int pid) =>
+        new OpenPortsResult { Error = "ERROR: --ports is not yet supported on this platform" };
+
     // Lightweight parent-PID-only lookup, used for ancestor-chain walking (--tree) where the
     // full env-block/PEB read would be wasted work.
     int GetParentPidOnly(int pid);
@@ -54,6 +60,22 @@ class OpenFilesResult
 {
     public IReadOnlyList<string> Files = Array.Empty<string>();
     public string Error = ""; // empty = no error (an empty Files list is valid)
+}
+
+class PortInfo
+{
+    public string Protocol = ""; // "TCP" or "UDP"
+    public string LocalAddress = "";
+    public int LocalPort;
+    public string RemoteAddress = ""; // empty for UDP (connectionless)
+    public int RemotePort; // 0 for UDP
+    public string State = ""; // TCP connection state; empty for UDP
+}
+
+class OpenPortsResult
+{
+    public IReadOnlyList<PortInfo> Ports = Array.Empty<PortInfo>();
+    public string Error = ""; // empty = no error (an empty Ports list is valid)
 }
 
 class ProcessDetails

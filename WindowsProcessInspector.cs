@@ -59,6 +59,38 @@ class WindowsProcessInspector : IProcessInspector
         public byte Directory;
     }
 
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion,
+        int tblClass, int reserved);
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    static extern uint GetExtendedUdpTable(IntPtr pUdpTable, ref int dwOutBufLen, bool sort, int ipVersion,
+        int tblClass, int reserved);
+
+    const int AF_INET = 2;
+    const int AF_INET6 = 23;
+    const int TCP_TABLE_OWNER_PID_ALL = 5;
+    const int UDP_TABLE_OWNER_PID = 1;
+
+    static readonly string[] TcpStates = new[]
+    {
+        "", "CLOSED", "LISTENING", "SYN_SENT", "SYN_RCVD", "ESTABLISHED", "FIN_WAIT1",
+        "FIN_WAIT2", "CLOSE_WAIT", "CLOSING", "LAST_ACK", "TIME_WAIT", "DELETE_TCB"
+    };
+
+    static string FormatIPv4(uint addr)
+    {
+        byte[] bytes = BitConverter.GetBytes(addr);
+        return new System.Net.IPAddress(bytes).ToString();
+    }
+
+    static string FormatIPv6(byte[] addr) =>
+        new System.Net.IPAddress(addr).ToString();
+
+    // Port numbers in these tables are stored network-byte-order in the low 16 bits.
+    static int PortFromNetworkOrder(uint raw) =>
+        ((int)(raw & 0xFF) << 8) | (int)((raw >> 8) & 0xFF);
+
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr CommandLineToArgvW(string cmdLine, out int numArgs);
 
@@ -321,6 +353,162 @@ class WindowsProcessInspector : IProcessInspector
         if (path.StartsWith(extendedPrefix, StringComparison.OrdinalIgnoreCase))
             return path.Substring(extendedPrefix.Length);
         return path;
+    }
+
+    public OpenPortsResult GetOpenPorts(int pid)
+    {
+        var result = new OpenPortsResult();
+        var ports = new List<PortInfo>();
+
+        string error =
+            ReadTcpTable(pid, AF_INET, ports) ??
+            ReadTcpTable(pid, AF_INET6, ports) ??
+            ReadUdpTable(pid, AF_INET, ports) ??
+            ReadUdpTable(pid, AF_INET6, ports);
+
+        // NOTE: each Read*Table call above always runs (arguments are evaluated eagerly before
+        // ?? short-circuits on the *result*), so all four tables get scanned regardless of
+        // whether an earlier one reported an error; we just keep the first error message, if any.
+        if (error != null)
+        {
+            result.Error = error;
+            return result;
+        }
+
+        result.Ports = ports
+            .OrderBy(p => p.Protocol)
+            .ThenBy(p => p.LocalPort)
+            .ToArray();
+        return result;
+    }
+
+    static string ReadTcpTable(int pid, int ipVersion, List<PortInfo> ports)
+    {
+        int bufferSize = 0;
+        GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, true, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
+        IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            uint rc = GetExtendedTcpTable(buffer, ref bufferSize, true, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
+            if (rc != 0) return "ERROR: GetExtendedTcpTable failed, code=" + rc;
+
+            int numEntries = Marshal.ReadInt32(buffer);
+            int rowSize = ipVersion == AF_INET ? 24 : 56;
+            IntPtr rowPtr = IntPtr.Add(buffer, 4);
+
+            for (int i = 0; i < numEntries; i++)
+            {
+                IntPtr row = IntPtr.Add(rowPtr, i * rowSize);
+                int owningPid = ipVersion == AF_INET
+                    ? Marshal.ReadInt32(row, 20)
+                    : Marshal.ReadInt32(row, 52);
+
+                if (owningPid != pid) continue;
+
+                if (ipVersion == AF_INET)
+                {
+                    int state = Marshal.ReadInt32(row, 0);
+                    uint localAddr = unchecked((uint)Marshal.ReadInt32(row, 4));
+                    uint localPortRaw = unchecked((uint)Marshal.ReadInt32(row, 8));
+                    uint remoteAddr = unchecked((uint)Marshal.ReadInt32(row, 12));
+                    uint remotePortRaw = unchecked((uint)Marshal.ReadInt32(row, 16));
+
+                    ports.Add(new PortInfo
+                    {
+                        Protocol = "TCP",
+                        LocalAddress = FormatIPv4(localAddr),
+                        LocalPort = PortFromNetworkOrder(localPortRaw),
+                        RemoteAddress = FormatIPv4(remoteAddr),
+                        RemotePort = PortFromNetworkOrder(remotePortRaw),
+                        State = state >= 0 && state < TcpStates.Length ? TcpStates[state] : "UNKNOWN"
+                    });
+                }
+                else
+                {
+                    byte[] localAddrBytes = new byte[16];
+                    Marshal.Copy(row, localAddrBytes, 0, 16);
+                    uint localPortRaw = unchecked((uint)Marshal.ReadInt32(row, 20));
+                    byte[] remoteAddrBytes = new byte[16];
+                    Marshal.Copy(IntPtr.Add(row, 24), remoteAddrBytes, 0, 16);
+                    uint remotePortRaw = unchecked((uint)Marshal.ReadInt32(row, 44));
+                    int state = Marshal.ReadInt32(row, 48);
+
+                    ports.Add(new PortInfo
+                    {
+                        Protocol = "TCP",
+                        LocalAddress = FormatIPv6(localAddrBytes),
+                        LocalPort = PortFromNetworkOrder(localPortRaw),
+                        RemoteAddress = FormatIPv6(remoteAddrBytes),
+                        RemotePort = PortFromNetworkOrder(remotePortRaw),
+                        State = state >= 0 && state < TcpStates.Length ? TcpStates[state] : "UNKNOWN"
+                    });
+                }
+            }
+
+            return null;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    static string ReadUdpTable(int pid, int ipVersion, List<PortInfo> ports)
+    {
+        int bufferSize = 0;
+        GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, true, ipVersion, UDP_TABLE_OWNER_PID, 0);
+        IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            uint rc = GetExtendedUdpTable(buffer, ref bufferSize, true, ipVersion, UDP_TABLE_OWNER_PID, 0);
+            if (rc != 0) return "ERROR: GetExtendedUdpTable failed, code=" + rc;
+
+            int numEntries = Marshal.ReadInt32(buffer);
+            int rowSize = ipVersion == AF_INET ? 12 : 28;
+            IntPtr rowPtr = IntPtr.Add(buffer, 4);
+
+            for (int i = 0; i < numEntries; i++)
+            {
+                IntPtr row = IntPtr.Add(rowPtr, i * rowSize);
+                int owningPid = ipVersion == AF_INET
+                    ? Marshal.ReadInt32(row, 8)
+                    : Marshal.ReadInt32(row, 24);
+
+                if (owningPid != pid) continue;
+
+                if (ipVersion == AF_INET)
+                {
+                    uint localAddr = unchecked((uint)Marshal.ReadInt32(row, 0));
+                    uint localPortRaw = unchecked((uint)Marshal.ReadInt32(row, 4));
+
+                    ports.Add(new PortInfo
+                    {
+                        Protocol = "UDP",
+                        LocalAddress = FormatIPv4(localAddr),
+                        LocalPort = PortFromNetworkOrder(localPortRaw)
+                    });
+                }
+                else
+                {
+                    byte[] localAddrBytes = new byte[16];
+                    Marshal.Copy(row, localAddrBytes, 0, 16);
+                    uint localPortRaw = unchecked((uint)Marshal.ReadInt32(row, 20));
+
+                    ports.Add(new PortInfo
+                    {
+                        Protocol = "UDP",
+                        LocalAddress = FormatIPv6(localAddrBytes),
+                        LocalPort = PortFromNetworkOrder(localPortRaw)
+                    });
+                }
+            }
+
+            return null;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     // Lightweight parent-PID lookup for ancestor-chain walking (--parents N/all): only opens

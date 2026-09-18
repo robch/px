@@ -130,7 +130,7 @@ class Program
         "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--location", "--args", "--env", "--files", "--pid", "--all", "--tree", "--cwd" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--location", "--args", "--env", "--files", "--ports", "--pid", "--all", "--tree", "--cwd" };
 
     // --- Help-text colorizing helpers -----------------------------------------------------
 
@@ -278,6 +278,7 @@ class Program
         WriteBodyLine("  --args      show the process's command-line args (fancy-colored) on the main line");
         WriteBodyLine("  --env       after everything else, show ALL environment variables for each process");
         WriteBodyLine("  --files     show regular files currently open by each process");
+        WriteBodyLine("  --ports     show TCP/UDP ports currently open by each process");
         WriteBodyLine("  --all       also show processes with no matching environment variables (see below)");
         WriteBodyLine("  --tree      show each matched process's full ancestry as a real tree (see below)");
         WriteBodyLine("  --cwd       show the process's current working directory right on its main line");
@@ -307,7 +308,7 @@ class Program
         Console.WriteLine();
         WriteBodyLine("  The normal top list is SKIPPED when --tree is given, since the tree (with --args if");
         WriteBodyLine("  requested) already shows everything it would - UNLESS --location (or --where), --files,");
-        WriteBodyLine("  or any env-showing flag is also given, since those show info the tree view doesn't.");
+        WriteBodyLine("  --ports, or any env-showing flag is also given, since those show info the tree view doesn't.");
         Console.WriteLine();
         WriteSectionHeader("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
         WriteBodyLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
@@ -340,6 +341,7 @@ class Program
         WriteExampleLine("px 'cyco*' --where", "(same as --location --cwd together)");
         WriteExampleLine("px cycodd --env");
         WriteExampleLine("px cycodd --files", "(show regular files currently open by each process)");
+        WriteExampleLine("px cycodd --ports", "(show TCP/UDP ports currently open by each process)");
         WriteExampleLine("px cycodd CYCODD_DAEMON_CHILD", "(implicit exact-match env var name filter, implies --env)");
         WriteExampleLine("px cycodd 'CYCODD_*'", "(implicit glob env var name filter, implies --env)");
         WriteExampleLine("px cycodd --env-name-contains PATH TEMP");
@@ -382,6 +384,7 @@ class Program
         public (string Raw, string Name, string Value)[] ParsedVars = Array.Empty<(string, string, string)>();
         public int EnvMatchCount;
         public OpenFilesResult OpenFiles = new();
+        public OpenPortsResult OpenPorts = new();
     }
 
     class ParsedArgs
@@ -396,6 +399,7 @@ class Program
         public bool ShowArgs = false;
         public bool ShowEnvExplicit = false;
         public bool ShowFiles = false;
+        public bool ShowPorts = false;
         public bool ShowPidExplicit = false;
         public bool ShowAll = false;
         public bool ShowTree = false;
@@ -509,6 +513,13 @@ class Program
             if (argLower == "--files")
             {
                 result.ShowFiles = true;
+                i++;
+                continue;
+            }
+
+            if (argLower == "--ports")
+            {
+                result.ShowPorts = true;
                 i++;
                 continue;
             }
@@ -1209,7 +1220,8 @@ class Program
                 {
                     Pid = pid, Details = details, ShortName = shortName, RestArgs = restArgs, Cwd = details.CurrentDirectory, SortKey = sortKey,
                     ParsedVars = parsedVars, EnvMatchCount = matchCount,
-                    OpenFiles = parsed.ShowFiles ? Inspector.GetOpenFiles(pid) : new OpenFilesResult()
+                    OpenFiles = parsed.ShowFiles ? Inspector.GetOpenFiles(pid) : new OpenFilesResult(),
+                    OpenPorts = parsed.ShowPorts ? Inspector.GetOpenPorts(pid) : new OpenPortsResult()
                 };
             })
             .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
@@ -1234,12 +1246,12 @@ class Program
         // terminal - it becomes impossible to tell where one process's args end and the next
         // one's PID/name begins. Detect that case and, if a given line's actual rendered width
         // would exceed the console width, add an extra blank line after it.
-        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv && !parsed.ShowFiles;
+        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv && !parsed.ShowFiles && !parsed.ShowPorts;
         int consoleWidth = SafeConsoleWidth();
 
         // When --tree is active, the top flat list is redundant UNLESS location, environment,
         // or open-file details are requested. Args are already shown per-node in the tree itself.
-        bool printTopList = !parsed.ShowTree || parsed.ShowLocation || parsed.ShouldShowEnv || parsed.ShowFiles;
+        bool printTopList = !parsed.ShowTree || parsed.ShowLocation || parsed.ShouldShowEnv || parsed.ShowFiles || parsed.ShowPorts;
 
         if (printTopList)
         foreach (var e in entries)
@@ -1296,8 +1308,8 @@ class Program
                 Console.WriteLine();
             }
 
-            // --- Open regular files and env vars, when requested ---
-            if (!parsed.ShowFiles && !parsed.ShouldShowEnv) continue;
+            // --- Open regular files, open ports, and env vars, when requested ---
+            if (!parsed.ShowFiles && !parsed.ShowPorts && !parsed.ShouldShowEnv) continue;
 
             if (!hasPathLine) Console.WriteLine();
 
@@ -1318,6 +1330,31 @@ class Program
                         Write("  ");
                         WriteExePathColored(file);
                         Console.WriteLine();
+                    }
+                }
+
+                if (parsed.ShowPorts || parsed.ShouldShowEnv)
+                    Console.WriteLine();
+            }
+
+            if (parsed.ShowPorts)
+            {
+                if (!string.IsNullOrEmpty(e.OpenPorts.Error))
+                {
+                    WriteLine("  " + e.OpenPorts.Error, Colors.Error);
+                }
+                else if (e.OpenPorts.Ports.Count == 0)
+                {
+                    WriteLine("  (no open ports)", Colors.Muted);
+                }
+                else
+                {
+                    foreach (var port in e.OpenPorts.Ports)
+                    {
+                        string line = port.RemotePort != 0 || !string.IsNullOrEmpty(port.RemoteAddress) && port.RemoteAddress != "0.0.0.0" && port.RemoteAddress != "::"
+                            ? $"  {port.Protocol,-3} {port.LocalAddress}:{port.LocalPort} -> {port.RemoteAddress}:{port.RemotePort} {port.State}"
+                            : $"  {port.Protocol,-3} {port.LocalAddress}:{port.LocalPort} {port.State}";
+                        WriteLine(line.TrimEnd(), Colors.Muted);
                     }
                 }
 
