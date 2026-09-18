@@ -34,10 +34,43 @@ class MacProcessInspector : IProcessInspector
     const int PROC_PIDTBSDINFO = 3;
     const int PROC_PIDVNODEPATHINFO = 9;
     const int PROC_PIDFDVNODEPATHINFO = 2;
+    const int PROC_PIDFDSOCKETINFO = 3;
     const uint PROX_FDTYPE_VNODE = 1;
+    const uint PROX_FDTYPE_SOCKET = 2;
     const ushort S_IFMT = 0xF000;
     const ushort S_IFREG = 0x8000;
     const int MAXPATHLEN = 1024;
+
+    // struct socket_fdinfo (bsd/sys/proc_info.h): { struct proc_fileinfo pfi; struct socket_info psi; }.
+    // Byte offsets below are absolute from the start of socket_fdinfo, cross-checked against the
+    // actively-maintained oshi-core-ffm project's explicit field-by-field struct layout (which
+    // itself targets these same stable/documented XNU structs) rather than derived by hand:
+    //   proc_fileinfo (pfi) is 24 bytes -> socket_info (psi) starts at 24.
+    //   Within socket_info: soi_kind at +232, soi_proto (union) at +240.
+    //   Within soi_proto, both tcp_sockinfo.tcpsi_ini and in_sockinfo (UDP's "pri_in") start at
+    //   the same offset 0, so the shared in_sockinfo fields below (fport/lport/vflag/faddr/laddr)
+    //   apply to TCP and UDP alike; tcpsi_state (TCP-only) follows the embedded in_sockinfo (80 bytes).
+    const int SoiKindOffset = 24 + 232;
+    const int InSockInfoOffset = 24 + 240;
+    const int InsiLportOffset = InSockInfoOffset + 4;
+    const int InsiFportOffset = InSockInfoOffset + 0;
+    const int InsiVflagOffset = InSockInfoOffset + 24;
+    const int InsiFaddrOffset = InSockInfoOffset + 32;
+    const int InsiLaddrOffset = InSockInfoOffset + 48;
+    const int TcpsiStateOffset = InSockInfoOffset + 80;
+    const int SocketFdInfoBufferSize = 800; // generous; actual struct is well under this
+
+    const int SOCKINFO_IN = 1; // UDP (or other non-TCP INET socket)
+    const int SOCKINFO_TCP = 2;
+    const byte INI_IPV4 = 0x1;
+    const byte INI_IPV6 = 0x2;
+
+    // TSI_S_* connection states (bsd/sys/proc_info.h), in enum order.
+    static readonly string[] TcpStates = new[]
+    {
+        "CLOSED", "LISTEN", "SYN_SENT", "SYN_RECEIVED", "ESTABLISHED", "CLOSE_WAIT",
+        "FIN_WAIT_1", "CLOSING", "LAST_ACK", "FIN_WAIT_2", "TIME_WAIT", "RESERVED"
+    };
 
     [DllImport("libc", SetLastError = true)]
     static extern int sysctl(int[] mib, uint namelen, byte[] oldp, ref IntPtr oldlenp, IntPtr newp, IntPtr newlen);
@@ -144,6 +177,104 @@ class MacProcessInspector : IProcessInspector
     }
 
     public int GetParentPidOnly(int pid) => ReadParentPid(pid);
+
+    public OpenPortsResult GetOpenPorts(int pid)
+    {
+        var result = new OpenPortsResult();
+
+        try
+        {
+            int requiredBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, IntPtr.Zero, 0);
+            if (requiredBytes <= 0)
+            {
+                int error = Marshal.GetLastWin32Error();
+                result.Error = error == 1 || error == 13
+                    ? "ERROR: permission denied reading open ports for process " + pid
+                    : "ERROR: could not read open ports for process " + pid + " (process may have exited)";
+                return result;
+            }
+
+            byte[] descriptorBuffer = new byte[requiredBytes + 32 * 8];
+            int descriptorBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, descriptorBuffer, descriptorBuffer.Length);
+            if (descriptorBytes <= 0)
+            {
+                int error = Marshal.GetLastWin32Error();
+                result.Error = error == 1 || error == 13
+                    ? "ERROR: permission denied reading open ports for process " + pid
+                    : "ERROR: could not read open ports for process " + pid + " (process may have exited)";
+                return result;
+            }
+
+            var ports = new List<PortInfo>();
+            for (int offset = 0; offset + 8 <= descriptorBytes; offset += 8)
+            {
+                int descriptor = BitConverter.ToInt32(descriptorBuffer, offset);
+                uint descriptorType = BitConverter.ToUInt32(descriptorBuffer, offset + 4);
+                if (descriptorType != PROX_FDTYPE_SOCKET)
+                    continue;
+
+                byte[] socketBuffer = new byte[SocketFdInfoBufferSize];
+                int socketBytes = proc_pidfdinfo(pid, descriptor, PROC_PIDFDSOCKETINFO, socketBuffer, socketBuffer.Length);
+                if (socketBytes < TcpsiStateOffset)
+                    continue; // descriptor closed or became inaccessible between listing and reading it
+
+                int kind = BitConverter.ToInt32(socketBuffer, SoiKindOffset);
+                if (kind != SOCKINFO_TCP && kind != SOCKINFO_IN)
+                    continue; // not an internet-protocol socket (e.g. unix domain, kernel event, etc.)
+
+                byte vflag = socketBuffer[InsiVflagOffset];
+                if ((vflag & (INI_IPV4 | INI_IPV6)) == 0)
+                    continue;
+
+                bool isIPv6 = (vflag & INI_IPV6) != 0;
+                int localPort = PortFromNetworkOrder(BitConverter.ToInt32(socketBuffer, InsiLportOffset));
+                int remotePort = PortFromNetworkOrder(BitConverter.ToInt32(socketBuffer, InsiFportOffset));
+
+                var portInfo = new PortInfo
+                {
+                    Protocol = kind == SOCKINFO_TCP ? "TCP" : "UDP",
+                    LocalAddress = ReadSocketAddress(socketBuffer, InsiLaddrOffset, isIPv6),
+                    LocalPort = localPort
+                };
+
+                if (kind == SOCKINFO_TCP)
+                {
+                    portInfo.RemoteAddress = ReadSocketAddress(socketBuffer, InsiFaddrOffset, isIPv6);
+                    portInfo.RemotePort = remotePort;
+                    int state = BitConverter.ToInt32(socketBuffer, TcpsiStateOffset);
+                    portInfo.State = state >= 0 && state < TcpStates.Length ? TcpStates[state] : "UNKNOWN";
+                }
+
+                ports.Add(portInfo);
+            }
+
+            result.Ports = ports.OrderBy(p => p.Protocol).ThenBy(p => p.LocalPort).ToArray();
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            result.Error = "ERROR: open-port inspection is unavailable on this version of macOS";
+        }
+
+        return result;
+    }
+
+    // insi_fport/insi_lport are 4-byte fields but only the low 16 bits are meaningful, holding
+    // the port in network (big-endian) byte order - the same "ntohs of the low 16 bits" rule
+    // every reference implementation (psutil, osquery, oshi, etc.) applies.
+    static int PortFromNetworkOrder(int raw) =>
+        ((raw & 0xFF) << 8) | ((raw >> 8) & 0xFF);
+
+    // insi_faddr/insi_laddr are each a 16-byte union of { in4in6_addr; in6_addr }. For IPv6, all
+    // 16 bytes are the address verbatim. For IPv4, the address is the last 4 bytes of the union
+    // (in4in6_addr's i46a_addr4 field, after 12 bytes of i46a_pad32 padding) - already in the
+    // correct byte order for System.Net.IPAddress, no reversal needed (unlike Linux's /proc/net
+    // hex dump, which uses the raw in-memory word order instead of network byte order).
+    static string ReadSocketAddress(byte[] buffer, int offset, bool isIPv6)
+    {
+        byte[] addressBytes = new byte[isIPv6 ? 16 : 4];
+        Array.Copy(buffer, isIPv6 ? offset : offset + 12, addressBytes, 0, addressBytes.Length);
+        return new System.Net.IPAddress(addressBytes).ToString();
+    }
 
     // KERN_PROCARGS2 buffer layout (well-documented/stable, used by `ps`, Activity Monitor-style
     // tools, etc.): [ argc:int32 ][ exec_path NUL-terminated ][ NUL padding ]

@@ -119,6 +119,146 @@ class LinuxProcessInspector : IProcessInspector
         return result;
     }
 
+    // TCP connection states as they appear (hex) in /proc/net/tcp[6]'s "st" column - order and
+    // naming mirrors the Windows MIB_TCP_STATE enum used by WindowsProcessInspector, so the
+    // rendered output looks the same across platforms.
+    static readonly string[] TcpStates = new[]
+    {
+        "", "ESTABLISHED", "SYN_SENT", "SYN_RECV", "FIN_WAIT1", "FIN_WAIT2", "TIME_WAIT",
+        "CLOSE", "CLOSE_WAIT", "LAST_ACK", "LISTEN", "CLOSING"
+    };
+
+    public OpenPortsResult GetOpenPorts(int pid)
+    {
+        var result = new OpenPortsResult();
+
+        try
+        {
+            var socketInodes = GetSocketInodes(pid);
+            var ports = new List<PortInfo>();
+
+            if (socketInodes.Count > 0)
+            {
+                ParseNetFile("/proc/net/tcp", "TCP", socketInodes, ports, includeRemote: true);
+                ParseNetFile("/proc/net/tcp6", "TCP", socketInodes, ports, includeRemote: true);
+                ParseNetFile("/proc/net/udp", "UDP", socketInodes, ports, includeRemote: false);
+                ParseNetFile("/proc/net/udp6", "UDP", socketInodes, ports, includeRemote: false);
+            }
+
+            result.Ports = ports.OrderBy(p => p.Protocol).ThenBy(p => p.LocalPort).ToArray();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            result.Error = "ERROR: permission denied reading open ports for process " + pid + " (try sudo)";
+        }
+        catch (IOException)
+        {
+            result.Error = "ERROR: could not read open ports for process " + pid + " (process may have exited)";
+        }
+
+        return result;
+    }
+
+    // /proc/<pid>/fd/<n> symlinks that represent sockets point to a pseudo-path of the form
+    // "socket:[<inode>]" - collecting those inodes lets us cross-reference the system-wide
+    // /proc/net/{tcp,tcp6,udp,udp6} tables (which have no per-pid view of their own) back to
+    // this specific process, the same way `lsof`/`ss -p` do.
+    static HashSet<long> GetSocketInodes(int pid)
+    {
+        var inodes = new HashSet<long>();
+        string fdDirectory = "/proc/" + pid + "/fd";
+
+        foreach (string descriptorPath in Directory.EnumerateFileSystemEntries(fdDirectory))
+        {
+            try
+            {
+                string target = new FileInfo(descriptorPath).LinkTarget ?? "";
+                if (target.StartsWith("socket:[") && target.EndsWith(']'))
+                {
+                    string inodeText = target.Substring(8, target.Length - 9);
+                    if (long.TryParse(inodeText, out long inode))
+                        inodes.Add(inode);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Closing descriptors are an expected race; keep every one we did obtain.
+            }
+        }
+
+        return inodes;
+    }
+
+    // /proc/net/tcp[6] and /proc/net/udp[6] are whitespace-separated tables, one connection/socket
+    // per line, with a header line to skip. Column layout (0-indexed after splitting):
+    //   0: sl  1: local_address  2: rem_address  3: st  4: tx_queue:rx_queue  5: tr:tm->when
+    //   6: retrnsmt  7: uid  8: timeout  9: inode  ...
+    // Every socket on the system is listed here (there's no per-pid view), so we only keep rows
+    // whose inode is one this process actually has open.
+    static void ParseNetFile(string path, string protocol, HashSet<long> socketInodes, List<PortInfo> ports, bool includeRemote)
+    {
+        if (!File.Exists(path)) return;
+
+        string[] lines;
+        try
+        {
+            lines = File.ReadAllLines(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        for (int i = 1; i < lines.Length; i++)
+        {
+            string[] fields = lines[i].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length < 10) continue;
+            if (!long.TryParse(fields[9], out long inode) || !socketInodes.Contains(inode)) continue;
+
+            var (localAddress, localPort) = ParseHexAddressAndPort(fields[1]);
+            int stateValue = Convert.ToInt32(fields[3], 16);
+
+            var portInfo = new PortInfo
+            {
+                Protocol = protocol,
+                LocalAddress = localAddress,
+                LocalPort = localPort,
+                State = includeRemote && stateValue >= 0 && stateValue < TcpStates.Length ? TcpStates[stateValue] : ""
+            };
+
+            if (includeRemote)
+            {
+                (portInfo.RemoteAddress, portInfo.RemotePort) = ParseHexAddressAndPort(fields[2]);
+            }
+
+            ports.Add(portInfo);
+        }
+    }
+
+    // /proc/net's address:port columns are hex-encoded: the port is a plain big-endian 16-bit
+    // hex value, but the address is the raw in-memory representation of an in_addr/in6_addr -
+    // i.e. little-endian per 32-bit word on virtually all real-world (x86/ARM) kernels - so each
+    // 4-byte (IPv4) or 4x4-byte (IPv6) group needs its bytes reversed before handing to IPAddress.
+    static (string address, int port) ParseHexAddressAndPort(string field)
+    {
+        int colon = field.IndexOf(':');
+        string addressHex = field.Substring(0, colon);
+        int port = Convert.ToInt32(field.Substring(colon + 1), 16);
+
+        int dwordCount = addressHex.Length / 8;
+        byte[] bytes = new byte[dwordCount * 4];
+        for (int dword = 0; dword < dwordCount; dword++)
+        {
+            for (int b = 0; b < 4; b++)
+            {
+                string byteHex = addressHex.Substring(dword * 8 + (3 - b) * 2, 2);
+                bytes[dword * 4 + b] = Convert.ToByte(byteHex, 16);
+            }
+        }
+
+        return (new System.Net.IPAddress(bytes).ToString(), port);
+    }
+
     // Lightweight parent-PID lookup for ancestor-chain walking (--tree): only reads
     // /proc/<pid>/stat, skipping the environ/cmdline/symlink reads GetProcessDetails does for
     // the primary matched processes. Returns -1 on any failure.
