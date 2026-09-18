@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
@@ -9,8 +11,17 @@ using System.Text;
 [SupportedOSPlatform("windows")]
 class WindowsProcessInspector : IProcessInspector
 {
+    const int PROCESS_DUP_HANDLE = 0x0040;
+    const uint DUPLICATE_SAME_ACCESS = 0x00000002;
+    const uint FILE_TYPE_DISK = 0x0001;
+    const int SystemExtendedHandleInformation = 64;
+    const int STATUS_INFO_LENGTH_MISMATCH = unchecked((int)0xC0000004);
+
     [DllImport("ntdll.dll")]
     static extern int NtQueryInformationProcess(IntPtr hProcess, int pic, byte[] pi, int piLen, out int retLen);
+
+    [DllImport("ntdll.dll")]
+    static extern int NtQuerySystemInformation(int informationClass, IntPtr information, int informationLength, out int returnLength);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr OpenProcess(int access, bool inherit, int pid);
@@ -20,6 +31,33 @@ class WindowsProcessInspector : IProcessInspector
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CloseHandle(IntPtr h);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr sourceHandle, IntPtr targetProcess,
+        out IntPtr targetHandle, uint desiredAccess, bool inheritHandle, uint options);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint GetFileType(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandleEx(IntPtr handle, int fileInformationClass,
+        out FileStandardInfo fileInformation, uint bufferSize);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandle(IntPtr handle, StringBuilder path, uint pathLength, uint flags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileStandardInfo
+    {
+        public long AllocationSize;
+        public long EndOfFile;
+        public uint NumberOfLinks;
+        public byte DeletePending;
+        public byte Directory;
+    }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr CommandLineToArgvW(string cmdLine, out int numArgs);
@@ -139,6 +177,150 @@ class WindowsProcessInspector : IProcessInspector
         {
             CloseHandle(h);
         }
+    }
+
+    sealed class SystemHandleSnapshot
+    {
+        public Dictionary<int, List<IntPtr>> HandlesByPid = new();
+        public string Error = "";
+    }
+
+    readonly Lazy<SystemHandleSnapshot> systemHandles = new(CaptureSystemHandles);
+
+    static SystemHandleSnapshot CaptureSystemHandles()
+    {
+        var snapshot = new SystemHandleSnapshot();
+        IntPtr handleTable = IntPtr.Zero;
+
+        try
+        {
+            int bufferSize = 1024 * 1024;
+            int status;
+            int requiredSize;
+            while (true)
+            {
+                handleTable = Marshal.AllocHGlobal(bufferSize);
+                status = NtQuerySystemInformation(SystemExtendedHandleInformation, handleTable, bufferSize, out requiredSize);
+                if (status != STATUS_INFO_LENGTH_MISMATCH)
+                    break;
+
+                Marshal.FreeHGlobal(handleTable);
+                handleTable = IntPtr.Zero;
+                bufferSize = Math.Max(bufferSize * 2, requiredSize + 65536);
+            }
+
+            if (status != 0)
+            {
+                snapshot.Error = "ERROR: could not enumerate system handles, status=" + status;
+                return snapshot;
+            }
+
+            ulong handleCount = unchecked((ulong)Marshal.ReadInt64(handleTable));
+            const int headerSize = 16;
+            const int entrySize = 40;
+
+            for (ulong index = 0; index < handleCount; index++)
+            {
+                IntPtr entry = IntPtr.Add(handleTable, checked(headerSize + (int)(index * entrySize)));
+                ulong ownerPid = unchecked((ulong)Marshal.ReadInt64(entry, 8));
+                if (ownerPid > int.MaxValue)
+                    continue;
+
+                int pid = (int)ownerPid;
+                if (!snapshot.HandlesByPid.TryGetValue(pid, out List<IntPtr> handles))
+                {
+                    handles = new List<IntPtr>();
+                    snapshot.HandlesByPid.Add(pid, handles);
+                }
+                handles.Add(new IntPtr(Marshal.ReadInt64(entry, 16)));
+            }
+        }
+        finally
+        {
+            if (handleTable != IntPtr.Zero)
+                Marshal.FreeHGlobal(handleTable);
+        }
+
+        return snapshot;
+    }
+
+    public OpenFilesResult GetOpenFiles(int pid)
+    {
+        var result = new OpenFilesResult();
+        SystemHandleSnapshot snapshot = systemHandles.Value;
+        if (!string.IsNullOrEmpty(snapshot.Error))
+        {
+            result.Error = snapshot.Error;
+            return result;
+        }
+
+        IntPtr processHandle = OpenProcess(PROCESS_DUP_HANDLE, false, pid);
+        if (processHandle == IntPtr.Zero)
+        {
+            result.Error = "ERROR: could not read open files for process " + pid +
+                ", OpenProcess code=" + Marshal.GetLastWin32Error();
+            return result;
+        }
+
+        try
+        {
+            var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            IntPtr currentProcess = GetCurrentProcess();
+            if (!snapshot.HandlesByPid.TryGetValue(pid, out List<IntPtr> handles))
+            {
+                result.Files = Array.Empty<string>();
+                return result;
+            }
+
+            foreach (IntPtr sourceHandle in handles)
+            {
+                if (!DuplicateHandle(processHandle, sourceHandle, currentProcess, out IntPtr localHandle,
+                    0, false, DUPLICATE_SAME_ACCESS))
+                    continue;
+
+                try
+                {
+                    if (GetFileType(localHandle) != FILE_TYPE_DISK)
+                        continue;
+
+                    if (!GetFileInformationByHandleEx(localHandle, 1, out FileStandardInfo fileInfo,
+                        (uint)Marshal.SizeOf<FileStandardInfo>()) || fileInfo.Directory != 0)
+                        continue;
+
+                    var path = new StringBuilder(32768);
+                    uint pathLength = GetFinalPathNameByHandle(localHandle, path, (uint)path.Capacity, 0);
+                    if (pathLength == 0 || pathLength >= path.Capacity)
+                        continue;
+
+                    string normalizedPath = NormalizeWindowsPath(path.ToString());
+                    if (!string.IsNullOrEmpty(normalizedPath))
+                        files.Add(normalizedPath);
+                }
+                finally
+                {
+                    CloseHandle(localHandle);
+                }
+            }
+
+            result.Files = files.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+            return result;
+        }
+        finally
+        {
+            CloseHandle(processHandle);
+        }
+    }
+
+    static string NormalizeWindowsPath(string path)
+    {
+        const string extendedUncPrefix = @"\\?\UNC\";
+        const string extendedPrefix = @"\\?\";
+
+        if (path.StartsWith(extendedUncPrefix, StringComparison.OrdinalIgnoreCase))
+            return @"\\" + path.Substring(extendedUncPrefix.Length);
+        if (path.StartsWith(extendedPrefix, StringComparison.OrdinalIgnoreCase))
+            return path.Substring(extendedPrefix.Length);
+        return path;
     }
 
     // Lightweight parent-PID lookup for ancestor-chain walking (--parents N/all): only opens
