@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
@@ -28,8 +30,13 @@ class MacProcessInspector : IProcessInspector
 {
     const int CTL_KERN = 1;
     const int KERN_PROCARGS2 = 49;
+    const int PROC_PIDLISTFDS = 1;
     const int PROC_PIDTBSDINFO = 3;
     const int PROC_PIDVNODEPATHINFO = 9;
+    const int PROC_PIDFDVNODEPATHINFO = 2;
+    const uint PROX_FDTYPE_VNODE = 1;
+    const ushort S_IFMT = 0xF000;
+    const ushort S_IFREG = 0x8000;
     const int MAXPATHLEN = 1024;
 
     [DllImport("libc", SetLastError = true)]
@@ -40,6 +47,12 @@ class MacProcessInspector : IProcessInspector
 
     [DllImport("libproc.dylib", SetLastError = true)]
     static extern int proc_pidinfo(int pid, int flavor, ulong arg, byte[] buffer, int buffersize);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    static extern int proc_pidinfo(int pid, int flavor, ulong arg, IntPtr buffer, int buffersize);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    static extern int proc_pidfdinfo(int pid, int fd, int flavor, byte[] buffer, int buffersize);
 
     public ProcessDetails GetProcessDetails(int pid)
     {
@@ -64,6 +77,70 @@ class MacProcessInspector : IProcessInspector
         }
 
         return details;
+    }
+
+    public OpenFilesResult GetOpenFiles(int pid)
+    {
+        var result = new OpenFilesResult();
+
+        try
+        {
+            // proc_fdinfo is two 32-bit values: descriptor number and descriptor type. Ask
+            // libproc for the required size first, with a little room for descriptors opened
+            // between the sizing and data calls.
+            int requiredBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, IntPtr.Zero, 0);
+            if (requiredBytes <= 0)
+            {
+                int error = Marshal.GetLastWin32Error();
+                result.Error = error == 1 || error == 13
+                    ? "ERROR: permission denied reading open files for process " + pid
+                    : "ERROR: could not read open files for process " + pid + " (process may have exited)";
+                return result;
+            }
+
+            byte[] descriptorBuffer = new byte[requiredBytes + 32 * 8];
+            int descriptorBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, descriptorBuffer, descriptorBuffer.Length);
+            if (descriptorBytes <= 0)
+            {
+                int error = Marshal.GetLastWin32Error();
+                result.Error = error == 1 || error == 13
+                    ? "ERROR: permission denied reading open files for process " + pid
+                    : "ERROR: could not read open files for process " + pid + " (process may have exited)";
+                return result;
+            }
+
+            var files = new HashSet<string>(StringComparer.Ordinal);
+            for (int offset = 0; offset + 8 <= descriptorBytes; offset += 8)
+            {
+                int descriptor = BitConverter.ToInt32(descriptorBuffer, offset);
+                uint descriptorType = BitConverter.ToUInt32(descriptorBuffer, offset + 4);
+                if (descriptorType != PROX_FDTYPE_VNODE)
+                    continue;
+
+                byte[] vnodeBuffer = new byte[2048];
+                int vnodeBytes = proc_pidfdinfo(pid, descriptor, PROC_PIDFDVNODEPATHINFO,
+                    vnodeBuffer, vnodeBuffer.Length);
+                if (vnodeBytes <= VnodePathOffset)
+                    continue; // descriptor closed, became inaccessible, or has no path
+
+                ushort mode = BitConverter.ToUInt16(vnodeBuffer, VnodeModeOffset);
+                if ((mode & S_IFMT) != S_IFREG)
+                    continue;
+
+                int maximumPathBytes = Math.Min(MAXPATHLEN, vnodeBytes - VnodePathOffset);
+                int pathEnd = Array.IndexOf(vnodeBuffer, (byte)0, VnodePathOffset, maximumPathBytes);
+                if (pathEnd > VnodePathOffset)
+                    files.Add(Encoding.UTF8.GetString(vnodeBuffer, VnodePathOffset, pathEnd - VnodePathOffset));
+            }
+
+            result.Files = files.OrderBy(path => path, StringComparer.Ordinal).ToArray();
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            result.Error = "ERROR: open-file inspection is unavailable on this version of macOS";
+        }
+
+        return result;
     }
 
     public int GetParentPidOnly(int pid) => ReadParentPid(pid);
@@ -182,6 +259,12 @@ class MacProcessInspector : IProcessInspector
     // class-level comment. If --cwd comes back wrong/empty on real hardware, this is the
     // first place to check (e.g. via a tiny native `offsetof` probe compiled on the target Mac).
     const int CwdPathOffset = 152;
+
+    // vnode_fdinfowithpath begins with a 24-byte proc_fileinfo followed by vnode_info_path.
+    // vinfo_stat.vst_mode is four bytes into vnode_info_path, while vip_path begins 128 bytes
+    // into it. These are the matching offsets from bsd/sys/proc_info.h.
+    const int VnodeModeOffset = 28;
+    const int VnodePathOffset = 176;
 
     static string ReadCurrentDirectory(int pid)
     {

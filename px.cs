@@ -8,7 +8,7 @@ using System.Text.RegularExpressions;
 class Program
 {
     // The one platform-conditional seam: everything needed to inspect ANOTHER process's private
-    // state (env vars, raw command line, image path, cwd, parent pid) lives behind this
+    // state (env vars, raw command line, image path, cwd, parent pid, open files) lives behind this
     // interface, since Windows/Linux/macOS each expose it through totally different mechanisms.
     // Everything else below (arg parsing/filtering, --tree building, colorized rendering,
     // run/shell/rerun launching) is OS-agnostic and doesn't change per platform.
@@ -130,7 +130,7 @@ class Program
         "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--location", "--args", "--env", "--pid", "--all", "--tree", "--cwd" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--location", "--args", "--env", "--files", "--pid", "--all", "--tree", "--cwd" };
 
     // --- Help-text colorizing helpers -----------------------------------------------------
 
@@ -241,7 +241,7 @@ class Program
 
     static void PrintUsage()
     {
-        WriteLine("px - inspect running processes: list PIDs, exe paths, command lines, and env vars", Colors.Header);
+        WriteLine("px - inspect running processes: list PIDs, exe paths, command lines, env vars, and open files", Colors.Header);
         Console.WriteLine();
         WriteSectionHeader("USAGE:");
         Console.WriteLine("  px <pid|process-name|name-fragment> [...] [<filter-value> ...] [<filter-flag> <value> [<value> ...]] ...");
@@ -277,6 +277,7 @@ class Program
         WriteBodyLine("  --location  show the full path to each process's executable");
         WriteBodyLine("  --args      show the process's command-line args (fancy-colored) on the main line");
         WriteBodyLine("  --env       after everything else, show ALL environment variables for each process");
+        WriteBodyLine("  --files     show regular files currently open by each process");
         WriteBodyLine("  --all       also show processes with no matching environment variables (see below)");
         WriteBodyLine("  --tree      show each matched process's full ancestry as a real tree (see below)");
         WriteBodyLine("  --cwd       show the process's current working directory right on its main line");
@@ -305,8 +306,8 @@ class Program
         WriteBodyLine("  '(dead parent <PID>)' (in red) or '(no parent)'.");
         Console.WriteLine();
         WriteBodyLine("  The normal top list is SKIPPED when --tree is given, since the tree (with --args if");
-        WriteBodyLine("  requested) already shows everything it would - UNLESS --location (or --where) or any");
-        WriteBodyLine("  env-showing flag is also given, since those show info the tree view doesn't.");
+        WriteBodyLine("  requested) already shows everything it would - UNLESS --location (or --where), --files,");
+        WriteBodyLine("  or any env-showing flag is also given, since those show info the tree view doesn't.");
         Console.WriteLine();
         WriteSectionHeader("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
         WriteBodyLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
@@ -338,6 +339,7 @@ class Program
         WriteExampleLine("px 'cyco*' --location --args");
         WriteExampleLine("px 'cyco*' --where", "(same as --location --cwd together)");
         WriteExampleLine("px cycodd --env");
+        WriteExampleLine("px cycodd --files", "(show regular files currently open by each process)");
         WriteExampleLine("px cycodd CYCODD_DAEMON_CHILD", "(implicit exact-match env var name filter, implies --env)");
         WriteExampleLine("px cycodd 'CYCODD_*'", "(implicit glob env var name filter, implies --env)");
         WriteExampleLine("px cycodd --env-name-contains PATH TEMP");
@@ -379,6 +381,7 @@ class Program
         public string SortKey = "";
         public (string Raw, string Name, string Value)[] ParsedVars = Array.Empty<(string, string, string)>();
         public int EnvMatchCount;
+        public OpenFilesResult OpenFiles = new();
     }
 
     class ParsedArgs
@@ -392,6 +395,7 @@ class Program
         public bool ShowLocation = false;
         public bool ShowArgs = false;
         public bool ShowEnvExplicit = false;
+        public bool ShowFiles = false;
         public bool ShowPidExplicit = false;
         public bool ShowAll = false;
         public bool ShowTree = false;
@@ -498,6 +502,13 @@ class Program
             if (argLower == "--env")
             {
                 result.ShowEnvExplicit = true;
+                i++;
+                continue;
+            }
+
+            if (argLower == "--files")
+            {
+                result.ShowFiles = true;
                 i++;
                 continue;
             }
@@ -1197,7 +1208,8 @@ class Program
                 return new MatchedEntry
                 {
                     Pid = pid, Details = details, ShortName = shortName, RestArgs = restArgs, Cwd = details.CurrentDirectory, SortKey = sortKey,
-                    ParsedVars = parsedVars, EnvMatchCount = matchCount
+                    ParsedVars = parsedVars, EnvMatchCount = matchCount,
+                    OpenFiles = parsed.ShowFiles ? Inspector.GetOpenFiles(pid) : new OpenFilesResult()
                 };
             })
             .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
@@ -1222,13 +1234,12 @@ class Program
         // terminal - it becomes impossible to tell where one process's args end and the next
         // one's PID/name begins. Detect that case and, if a given line's actual rendered width
         // would exceed the console width, add an extra blank line after it.
-        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv;
+        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv && !parsed.ShowFiles;
         int consoleWidth = SafeConsoleWidth();
 
-        // When --tree is active, the top flat list is redundant UNLESS --location or env vars are
-        // also requested (those show info the tree view doesn't). Args are already shown per-node
-        // in the tree itself, so --args alone doesn't force the top list to print.
-        bool printTopList = !parsed.ShowTree || parsed.ShowLocation || parsed.ShouldShowEnv;
+        // When --tree is active, the top flat list is redundant UNLESS location, environment,
+        // or open-file details are requested. Args are already shown per-node in the tree itself.
+        bool printTopList = !parsed.ShowTree || parsed.ShowLocation || parsed.ShouldShowEnv || parsed.ShowFiles;
 
         if (printTopList)
         foreach (var e in entries)
@@ -1285,34 +1296,61 @@ class Program
                 Console.WriteLine();
             }
 
-            // --- Env vars, only if explicitly requested or filtered ---
-            if (!parsed.ShouldShowEnv) continue;
+            // --- Open regular files and env vars, when requested ---
+            if (!parsed.ShowFiles && !parsed.ShouldShowEnv) continue;
 
             if (!hasPathLine) Console.WriteLine();
 
-            if (!string.IsNullOrEmpty(e.Details.Error))
+            if (parsed.ShowFiles)
             {
-                WriteLine("  " + e.Details.Error, Colors.Error);
-                Console.WriteLine();
-                continue;
+                if (!string.IsNullOrEmpty(e.OpenFiles.Error))
+                {
+                    WriteLine("  " + e.OpenFiles.Error, Colors.Error);
+                }
+                else if (e.OpenFiles.Files.Count == 0)
+                {
+                    WriteLine("  (no open files)", Colors.Muted);
+                }
+                else
+                {
+                    foreach (string file in e.OpenFiles.Files)
+                    {
+                        Write("  ");
+                        WriteExePathColored(file);
+                        Console.WriteLine();
+                    }
+                }
+
+                if (parsed.ShouldShowEnv)
+                    Console.WriteLine();
             }
 
-            var varNames = e.ParsedVars.Select(pv => pv.Name).ToArray();
-            var compiledImplicit = CompileImplicitFilters(parsed.ImplicitFilters, varNames);
-
-            foreach (var pv in e.ParsedVars)
+            if (parsed.ShouldShowEnv)
             {
-                if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
+                if (!string.IsNullOrEmpty(e.Details.Error))
                 {
-                    Write("  ");
-                    Write(pv.Name, Colors.EnvName);
-                    Write("=");
-                    WriteLine(pv.Value, Colors.EnvValue);
+                    WriteLine("  " + e.Details.Error, Colors.Error);
+                }
+                else
+                {
+                    var varNames = e.ParsedVars.Select(pv => pv.Name).ToArray();
+                    var compiledImplicit = CompileImplicitFilters(parsed.ImplicitFilters, varNames);
+
+                    foreach (var pv in e.ParsedVars)
+                    {
+                        if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
+                        {
+                            Write("  ");
+                            Write(pv.Name, Colors.EnvName);
+                            Write("=");
+                            WriteLine(pv.Value, Colors.EnvValue);
+                        }
+                    }
+
+                    if (e.EnvMatchCount == 0)
+                        WriteLine("  (no matching environment variables)", Colors.Muted);
                 }
             }
-
-            if (e.EnvMatchCount == 0)
-                WriteLine("  (no matching environment variables)", Colors.Muted);
 
             Console.WriteLine();
         }

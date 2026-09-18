@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
 
@@ -20,6 +23,13 @@ using System.Text;
 [SupportedOSPlatform("linux")]
 class LinuxProcessInspector : IProcessInspector
 {
+    const uint S_IFMT = 0xF000;
+    const uint S_IFREG = 0x8000;
+    const int StatModeOffset = 24; // x64 Linux struct stat: st_mode follows st_dev/st_ino/st_nlink
+
+    [DllImport("libc", SetLastError = true)]
+    static extern int stat(string path, byte[] buffer);
+
     public ProcessDetails GetProcessDetails(int pid)
     {
         var details = new ProcessDetails();
@@ -59,6 +69,54 @@ class LinuxProcessInspector : IProcessInspector
         }
 
         return details;
+    }
+
+    public OpenFilesResult GetOpenFiles(int pid)
+    {
+        var result = new OpenFilesResult();
+        string fdDirectory = "/proc/" + pid + "/fd";
+
+        try
+        {
+            var files = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string descriptorPath in Directory.EnumerateFileSystemEntries(fdDirectory))
+            {
+                try
+                {
+                    // stat() follows the descriptor symlink and lets us reject directories,
+                    // sockets, pipes, and devices before treating its target as a file path.
+                    byte[] statBuffer = new byte[256];
+                    if (stat(descriptorPath, statBuffer) != 0)
+                        continue; // the descriptor may have closed while we were enumerating it
+
+                    uint mode = BitConverter.ToUInt32(statBuffer, StatModeOffset);
+                    if ((mode & S_IFMT) != S_IFREG)
+                        continue;
+
+                    // Read the link itself rather than resolving the final target so Linux's
+                    // useful " (deleted)" suffix is retained for an unlinked-but-open file.
+                    string target = new FileInfo(descriptorPath).LinkTarget ?? "";
+                    if (target.StartsWith('/'))
+                        files.Add(target);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Closing descriptors are an expected race; keep every path we did obtain.
+                }
+            }
+
+            result.Files = files.OrderBy(path => path, StringComparer.Ordinal).ToArray();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            result.Error = "ERROR: permission denied reading open files for process " + pid + " (try sudo)";
+        }
+        catch (IOException)
+        {
+            result.Error = "ERROR: could not read open files for process " + pid + " (process may have exited)";
+        }
+
+        return result;
     }
 
     // Lightweight parent-PID lookup for ancestor-chain walking (--tree): only reads

@@ -1,11 +1,11 @@
 # px
 
-`px` (formerly `penv`) is a small Windows console utility for inspecting
+`px` (formerly `penv`) is a small cross-platform console utility for inspecting
 running processes: resolve them by PID, exact name, name fragment, or glob;
 list their PIDs and executable names/paths; dump a ready-to-run command line
-(exe + properly re-escaped args); and print/filter their environment
-variables. It can also launch a shell or command in a process's context, or
-rerun that process.
+(exe + properly re-escaped args); print/filter their environment variables;
+and list regular files they currently have open. It can also launch a shell or
+command in a process's context, or rerun that process.
 
 Windows doesn't expose another process's environment block (or full
 command line) through normal tools like `tasklist` or PowerShell's
@@ -18,6 +18,21 @@ memory. `px` does this by:
 4. Reading `ProcessParameters` to get the `ImagePathName`, `CommandLine`,
    and `Environment` block pointers
 5. Reading each of those and printing/filtering the results
+
+## Open files
+
+Use `--files` to list regular filesystem files currently open by each matched
+process:
+
+```text
+px <pid> --files
+px chrome --files
+```
+
+The list is deduplicated and sorted. Directories, sockets, pipes, devices, and
+other OS-specific handles/descriptors are intentionally excluded. Access may
+be limited by process ownership, elevation, sandboxing, or other operating
+system security controls.
 
 ## Process actions
 
@@ -52,7 +67,7 @@ handles, shell-local aliases/functions, or other unexported state.
 
 ## Requirements
 
-- Windows, x64
+- Windows, Linux, or macOS (x64)
 - .NET 10 SDK to build
 - You must have permission to read the target process's memory (this
   generally works for your own processes without elevation; for processes

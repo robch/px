@@ -1,3 +1,5 @@
+using System;
+
 using System.Collections.Generic;
 using System.Diagnostics;
 
@@ -12,6 +14,10 @@ interface IProcessInspector
 {
     // Reads env block, raw command line, image path, cwd, and parent pid for the given process.
     ProcessDetails GetProcessDetails(int pid);
+
+    // Lists regular filesystem files currently open by the process. Directories, sockets,
+    // pipes, devices, and other OS-specific handle/descriptor types are intentionally excluded.
+    OpenFilesResult GetOpenFiles(int pid);
 
     // Lightweight parent-PID-only lookup, used for ancestor-chain walking (--tree) where the
     // full env-block/PEB read would be wasted work.
@@ -42,6 +48,12 @@ interface IProcessInspector
         try { return System.Diagnostics.Process.GetProcessById(pid).ProcessName; }
         catch { return "?"; }
     }
+}
+
+class OpenFilesResult
+{
+    public IReadOnlyList<string> Files = Array.Empty<string>();
+    public string Error = ""; // empty = no error (an empty Files list is valid)
 }
 
 class ProcessDetails
