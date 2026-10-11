@@ -132,6 +132,10 @@ class Program
 
     static readonly string[] BooleanFlags = new[] { "--where", "--location", "--args", "--env", "--files", "--ports", "--pid", "--all", "--tree", "--cwd" };
 
+    static readonly string[] HelpFlags = new[] { "--help", "-h", "-?", "/?" };
+
+    static bool IsHelpFlag(string arg) => Array.IndexOf(HelpFlags, arg.ToLowerInvariant()) >= 0;
+
     // --- Help-text colorizing helpers -----------------------------------------------------
 
     static readonly Regex InlineFlagPattern = new(@"(--[a-zA-Z][a-zA-Z0-9-]*)");
@@ -249,6 +253,7 @@ class Program
         Console.WriteLine("  px <pid> shell");
         Console.WriteLine("  px <pid> run [--] <command> [<arg> ...]");
         Console.WriteLine("  px <pid> rerun");
+        Console.WriteLine("  px --help    (or -h, -?, /? - or just 'px' with no arguments)");
         Console.WriteLine();
         WriteSectionHeader("PROCESS ACTIONS:");
         Console.WriteLine("  shell   start the nearest shell found in the process ancestry, using the target");
@@ -410,6 +415,7 @@ class Program
         // unless the token itself contains '*'/'?'.
         public List<string> ImplicitFilters = new List<string>();
         public List<string> UnresolvedTargets = new List<string>();
+        public List<string> UnknownOptions = new List<string>();
 
         public bool HasFilters =>
             Contains.Count > 0 ||
@@ -571,6 +577,13 @@ class Program
                     target!.Add(args[i]);
                     i++;
                 }
+                continue;
+            }
+
+            if (arg.StartsWith("--"))
+            {
+                result.UnknownOptions.Add(arg);
+                i++;
                 continue;
             }
 
@@ -764,6 +777,14 @@ class Program
             Write(sep.ToString(), Colors.Muted);
             Write(valueRest, valueRest.StartsWith("\"") ? Colors.QuotedString : Colors.OptValue);
         }
+    }
+
+    static string FormatEndpoint(string address, int port)
+    {
+        var useIPv6Format = address.Contains(':');
+        return useIPv6Format
+            ? $"[{address}]:{port}"
+            : $"{address}:{port}";
     }
 
     static int SafeConsoleWidth()
@@ -1164,7 +1185,19 @@ class Program
                 return RunProcessAction(actionPid, action, args.Skip(2).ToArray());
         }
 
+        if (args.Any(IsHelpFlag))
+        {
+            PrintUsage();
+            return 0;
+        }
+
         var parsed = ParseArgs(args);
+
+        if (parsed.UnknownOptions.Count > 0)
+        {
+            WriteLine("ERROR: unknown option(s) '" + string.Join("', '", parsed.UnknownOptions) + "' - run 'px --help' to see all options", Colors.Error);
+            return 2;
+        }
 
         if (parsed.Pids.Count == 0)
         {
@@ -1352,8 +1385,8 @@ class Program
                     foreach (var port in e.OpenPorts.Ports)
                     {
                         string line = port.RemotePort != 0 || !string.IsNullOrEmpty(port.RemoteAddress) && port.RemoteAddress != "0.0.0.0" && port.RemoteAddress != "::"
-                            ? $"  {port.Protocol,-3} {port.LocalAddress}:{port.LocalPort} -> {port.RemoteAddress}:{port.RemotePort} {port.State}"
-                            : $"  {port.Protocol,-3} {port.LocalAddress}:{port.LocalPort} {port.State}";
+                            ? $"  {port.Protocol,-3} {FormatEndpoint(port.LocalAddress, port.LocalPort)} -> {FormatEndpoint(port.RemoteAddress, port.RemotePort)} {port.State}"
+                            : $"  {port.Protocol,-3} {FormatEndpoint(port.LocalAddress, port.LocalPort)} {port.State}";
                         WriteLine(line.TrimEnd(), Colors.Muted);
                     }
                 }

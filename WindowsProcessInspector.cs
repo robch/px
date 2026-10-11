@@ -355,43 +355,80 @@ class WindowsProcessInspector : IProcessInspector
         return path;
     }
 
+    static readonly Lazy<(Dictionary<int, List<PortInfo>> PortsByPid, string Error)> PortSnapshot = new(ReadPortSnapshot);
+
     public OpenPortsResult GetOpenPorts(int pid)
     {
-        var result = new OpenPortsResult();
-        var ports = new List<PortInfo>();
+        var (portsByPid, error) = PortSnapshot.Value;
+        if (error != null) return new OpenPortsResult { Error = error };
 
-        string error =
-            ReadTcpTable(pid, AF_INET, ports) ??
-            ReadTcpTable(pid, AF_INET6, ports) ??
-            ReadUdpTable(pid, AF_INET, ports) ??
-            ReadUdpTable(pid, AF_INET6, ports);
-
-        // NOTE: each Read*Table call above always runs (arguments are evaluated eagerly before
-        // ?? short-circuits on the *result*), so all four tables get scanned regardless of
-        // whether an earlier one reported an error; we just keep the first error message, if any.
-        if (error != null)
+        return new OpenPortsResult
         {
-            result.Error = error;
-            return result;
-        }
-
-        result.Ports = ports
-            .OrderBy(p => p.Protocol)
-            .ThenBy(p => p.LocalPort)
-            .ToArray();
-        return result;
+            Ports = portsByPid.TryGetValue(pid, out var ports)
+                ? ports.OrderBy(p => p.Protocol).ThenBy(p => p.LocalPort).ToArray()
+                : Array.Empty<PortInfo>()
+        };
     }
 
-    static string ReadTcpTable(int pid, int ipVersion, List<PortInfo> ports)
+    static (Dictionary<int, List<PortInfo>>, string) ReadPortSnapshot()
     {
-        int bufferSize = 0;
-        GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, true, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
-        IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+        var portsByPid = new Dictionary<int, List<PortInfo>>();
+
+        // NOTE: each Read*Table call below always runs (arguments are evaluated eagerly before
+        // ?? short-circuits on the *result*), so all four tables get scanned regardless of
+        // whether an earlier one reported an error; we just keep the first error message, if any.
+        string error =
+            ReadTcpTable(AF_INET, portsByPid) ??
+            ReadTcpTable(AF_INET6, portsByPid) ??
+            ReadUdpTable(AF_INET, portsByPid) ??
+            ReadUdpTable(AF_INET6, portsByPid);
+
+        return (portsByPid, error);
+    }
+
+    static void AddPort(Dictionary<int, List<PortInfo>> portsByPid, int pid, PortInfo port)
+    {
+        if (!portsByPid.TryGetValue(pid, out var ports))
+            portsByPid[pid] = ports = new List<PortInfo>();
+        ports.Add(port);
+    }
+
+    const uint ERROR_INSUFFICIENT_BUFFER = 122;
+    const int MaxTableReadAttempts = 5;
+
+    // Calls GetExtendedTcpTable/GetExtendedUdpTable until the buffer is big enough. The table can
+    // grow between the size query and the real read (a connection opening in between), which
+    // returns ERROR_INSUFFICIENT_BUFFER with the new required size - so just retry with that size.
+    // On success, the caller owns (and must free) the returned buffer.
+    static string ReadTable(Func<IntPtr, int, (uint Rc, int Size)> read, string apiName, out IntPtr buffer)
+    {
+        buffer = IntPtr.Zero;
+        int bufferSize = read(IntPtr.Zero, 0).Size;
+        for (int attempt = 0; attempt < MaxTableReadAttempts; attempt++)
+        {
+            buffer = Marshal.AllocHGlobal(bufferSize);
+            var (rc, requiredSize) = read(buffer, bufferSize);
+            if (rc == 0) return null;
+
+            Marshal.FreeHGlobal(buffer);
+            buffer = IntPtr.Zero;
+            if (rc != ERROR_INSUFFICIENT_BUFFER) return $"ERROR: {apiName} failed, code={rc}";
+            bufferSize = requiredSize;
+        }
+        return $"ERROR: {apiName} failed, table kept growing";
+    }
+
+    static string ReadTcpTable(int ipVersion, Dictionary<int, List<PortInfo>> portsByPid)
+    {
+        string error = ReadTable((buf, size) =>
+        {
+            uint rc = GetExtendedTcpTable(buf, ref size, true, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
+            return (rc, size);
+        }, "GetExtendedTcpTable", out IntPtr buffer);
+        if (error != null) return error;
+
         try
         {
-            uint rc = GetExtendedTcpTable(buffer, ref bufferSize, true, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
-            if (rc != 0) return "ERROR: GetExtendedTcpTable failed, code=" + rc;
-
             int numEntries = Marshal.ReadInt32(buffer);
             int rowSize = ipVersion == AF_INET ? 24 : 56;
             IntPtr rowPtr = IntPtr.Add(buffer, 4);
@@ -403,8 +440,6 @@ class WindowsProcessInspector : IProcessInspector
                     ? Marshal.ReadInt32(row, 20)
                     : Marshal.ReadInt32(row, 52);
 
-                if (owningPid != pid) continue;
-
                 if (ipVersion == AF_INET)
                 {
                     int state = Marshal.ReadInt32(row, 0);
@@ -413,7 +448,7 @@ class WindowsProcessInspector : IProcessInspector
                     uint remoteAddr = unchecked((uint)Marshal.ReadInt32(row, 12));
                     uint remotePortRaw = unchecked((uint)Marshal.ReadInt32(row, 16));
 
-                    ports.Add(new PortInfo
+                    AddPort(portsByPid, owningPid, new PortInfo
                     {
                         Protocol = "TCP",
                         LocalAddress = FormatIPv4(localAddr),
@@ -433,7 +468,7 @@ class WindowsProcessInspector : IProcessInspector
                     uint remotePortRaw = unchecked((uint)Marshal.ReadInt32(row, 44));
                     int state = Marshal.ReadInt32(row, 48);
 
-                    ports.Add(new PortInfo
+                    AddPort(portsByPid, owningPid, new PortInfo
                     {
                         Protocol = "TCP",
                         LocalAddress = FormatIPv6(localAddrBytes),
@@ -453,16 +488,17 @@ class WindowsProcessInspector : IProcessInspector
         }
     }
 
-    static string ReadUdpTable(int pid, int ipVersion, List<PortInfo> ports)
+    static string ReadUdpTable(int ipVersion, Dictionary<int, List<PortInfo>> portsByPid)
     {
-        int bufferSize = 0;
-        GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, true, ipVersion, UDP_TABLE_OWNER_PID, 0);
-        IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+        string error = ReadTable((buf, size) =>
+        {
+            uint rc = GetExtendedUdpTable(buf, ref size, true, ipVersion, UDP_TABLE_OWNER_PID, 0);
+            return (rc, size);
+        }, "GetExtendedUdpTable", out IntPtr buffer);
+        if (error != null) return error;
+
         try
         {
-            uint rc = GetExtendedUdpTable(buffer, ref bufferSize, true, ipVersion, UDP_TABLE_OWNER_PID, 0);
-            if (rc != 0) return "ERROR: GetExtendedUdpTable failed, code=" + rc;
-
             int numEntries = Marshal.ReadInt32(buffer);
             int rowSize = ipVersion == AF_INET ? 12 : 28;
             IntPtr rowPtr = IntPtr.Add(buffer, 4);
@@ -474,14 +510,12 @@ class WindowsProcessInspector : IProcessInspector
                     ? Marshal.ReadInt32(row, 8)
                     : Marshal.ReadInt32(row, 24);
 
-                if (owningPid != pid) continue;
-
                 if (ipVersion == AF_INET)
                 {
                     uint localAddr = unchecked((uint)Marshal.ReadInt32(row, 0));
                     uint localPortRaw = unchecked((uint)Marshal.ReadInt32(row, 4));
 
-                    ports.Add(new PortInfo
+                    AddPort(portsByPid, owningPid, new PortInfo
                     {
                         Protocol = "UDP",
                         LocalAddress = FormatIPv4(localAddr),
@@ -494,7 +528,7 @@ class WindowsProcessInspector : IProcessInspector
                     Marshal.Copy(row, localAddrBytes, 0, 16);
                     uint localPortRaw = unchecked((uint)Marshal.ReadInt32(row, 20));
 
-                    ports.Add(new PortInfo
+                    AddPort(portsByPid, owningPid, new PortInfo
                     {
                         Protocol = "UDP",
                         LocalAddress = FormatIPv6(localAddrBytes),
@@ -511,7 +545,7 @@ class WindowsProcessInspector : IProcessInspector
         }
     }
 
-    // Lightweight parent-PID lookup for ancestor-chain walking (--parents N/all): only opens
+    // Lightweight parent-PID lookup for ancestor-chain walking (--tree): only opens
     // the process and reads PROCESS_BASIC_INFORMATION, skipping the PEB/env-block work that
     // GetProcessDetails does for the primary matched processes. Returns -1 on any failure.
     public int GetParentPidOnly(int pid)
