@@ -35,6 +35,10 @@ px 12345 67890
 With no target, a command containing only options such as `--tree`, `--args`, or
 `--env` operates on all running processes.
 
+Run `px` with no arguments, or `px --help` (also `-h`, `-?`, `/?`), to show usage.
+An unrecognized `--option` is reported as an error rather than being treated as a
+process name or environment-variable filter.
+
 ## Process information
 
 ```text
@@ -107,7 +111,8 @@ px chrome --ports
 ```
 
 TCP entries include local and remote addresses, ports, and connection state.
-UDP entries include the local address and port. Port inspection is subject to
+UDP entries include the local address and port. IPv6 endpoints are shown in
+bracketed form, e.g. `[2607:6bc0::10]:443`. Port inspection is subject to
 the permissions and security controls of the operating system.
 
 ## Process trees
